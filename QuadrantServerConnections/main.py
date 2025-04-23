@@ -6,6 +6,7 @@ from services.pdf_processor import PDFProcessor
 from services.text_chunker import TextChunker
 from services.document_uploader import DocumentUploader
 import os
+import uvicorn
 
 app = FastAPI()
 
@@ -29,3 +30,7 @@ async def upload_pdf(file: UploadFile, collection_name: str | None = None):
         raise HTTPException(status_code=400, detail="Only PDF files allowed.")
     contents = await file.read()
     return uploader.upload(contents, file.filename, collection_name)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
