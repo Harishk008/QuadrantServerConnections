@@ -11,12 +11,14 @@ import uvicorn
 import json # Needed for loading image paths
 import base64 # Needed for encoding images
 from typing import List # For type hinting
+from langchain_ollama import OllamaLLM
 
 app = FastAPI()
 
 # --- Configuration ---
 QDRANT_URL = os.getenv("QDRANT_URL", "http://ai-lab.sagitec.com:6333")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ai-lab.sagitec.com:11434/")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:12b")
 EMBED_MODEL = "mxbai-embed-large:latest" # Make sure this model is available in Ollama
 # Check model dimension, mxbai-embed-large is likely 1024, but verify if needed
 EMBEDDING_DIM = 1024 # Typically 1024 for mxbai-embed-large
@@ -34,6 +36,20 @@ chunker = TextChunker()
 pdf_processor = PDFProcessor(IMAGE_DIR)
 # Pass the correct default collection name
 uploader = DocumentUploader(qdrant, embedder, chunker, pdf_processor, DEFAULT_COLLECTION)
+# --- End Initialization ---
+
+# --- Initialize the LLM ---
+try:
+    llm = OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_URL)
+    print(f"LLM initialized with model: {LLM_MODEL} from {OLLAMA_URL}")
+    # Optional: Test LLM with a simple invoke on startup
+    # llm.invoke("Why is the sky blue?")
+    # print("LLM test invoke successful.")
+except Exception as e:
+    print(f"!!! ERROR initializing LLM: {e} !!!")
+    print("!!! Query augmentation will likely fail. Check Ollama status and model name. !!!")
+    llm = None # Set llm to None if initialization fails
+
 # --- End Initialization ---
 
 # --- Pydantic Models for Request Bodies ---
@@ -99,77 +115,126 @@ def delete_collection_endpoint(payload: CollectionNamePayload): # Use Pydantic m
             detail = f"Failed to delete collection: {error_message}"
         raise HTTPException(status_code=status_code, detail=detail)
 
-
 @app.post("/query")
-def query_endpoint(payload: QueryPayload): # Use Pydantic model
+# async def query_endpoint(request: Request, payload: QueryPayload): # Add async if using await llm.ainvoke
+async def query_endpoint(payload: QueryPayload): # Keep sync for now if llm.invoke is sync
+    if not llm:
+         raise HTTPException(status_code=500, detail="LLM (for query augmentation) is not initialized. Check backend logs.")
+
     try:
         query_text = payload.query
         collection_name = payload.collection_name
+        print(f"Received query for collection '{collection_name}': {query_text}")
 
         # 1. Embed the query
         query_vector = embedder.embed(query_text)
 
         # 2. Search Qdrant
-        search_result = qdrant.get_client().search(
+        # Use query_points instead of search
+        search_result = qdrant.get_client().query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
-            limit=3,  # Retrieve top 3 results
-            with_payload=True  # Ensure payload (metadata) is returned
+            query=query_vector,
+            limit=5,  # Retrieve maybe a few more chunks for better context
+            with_payload=True
         )
+        print(f"Qdrant search returned {len(search_result.points)} results.")
 
-        # 3. Process results
+
+        # 3. Process results for context and images
         context_texts = []
-        retrieved_image_paths = set() # Use set to avoid duplicate image paths
+        retrieved_image_paths = set()
 
-        for hit in search_result:
+        # Handle both search_result structure (older) and query_points result structure (newer)
+        hits = []
+        if hasattr(search_result, 'points'): # For query_points result
+            hits = search_result.points
+        elif isinstance(search_result, list): # For older search result
+            hits = search_result
+
+        for hit in hits:
             payload_data = hit.payload
             if payload_data:
-                context_texts.append(payload_data.get("text", ""))
-                # Image paths are stored as a JSON string, parse it
+                chunk_text = payload_data.get("text")
+                if chunk_text:
+                    context_texts.append(chunk_text)
+
                 image_paths_json = payload_data.get("associated_image_paths", "[]")
                 try:
                     image_paths = json.loads(image_paths_json)
-                    # Add valid paths relative to IMAGE_DIR
                     for img_path in image_paths:
-                         # Only add if it seems like a valid path within our storage
-                         if img_path.startswith(IMAGE_DIR.replace("./","").replace(".\\", "")):
-                            retrieved_image_paths.add(img_path)
-                         elif not os.path.isabs(img_path): # Handle relative paths stored differently
+                        # Basic validation - adapt path if needed based on how it's stored
+                        potential_path = img_path
+                        if not os.path.isabs(img_path) and not img_path.startswith(IMAGE_DIR):
                              potential_path = os.path.join(IMAGE_DIR, os.path.basename(img_path))
-                             if os.path.exists(potential_path):
-                                 retrieved_image_paths.add(potential_path)
+
+                        if os.path.exists(potential_path):
+                             retrieved_image_paths.add(potential_path)
+                        # else:
+                        #      print(f"Debug: Image path {img_path} (resolved to {potential_path}) not found.")
 
                 except json.JSONDecodeError:
                     print(f"Warning: Could not decode image paths JSON: {image_paths_json}")
 
-        # Combine context for a basic answer (can be enhanced with LLM later)
-        answer = "\n---\n".join(context_texts) if context_texts else "No relevant information found."
+        # 4. Generate Augmented Answer using LLM (if context found)
+        final_answer = "No relevant information found in the documents." # Default answer
 
-        # 4. Load and encode images
+        if context_texts:
+            print("Context found, invoking LLM for augmentation...")
+            combined_context = "\n\n---\n\n".join(context_texts)
+
+            # --- Basic Prompt Template ---
+            prompt = f"""Based *only* on the following context retrieved from documents, please provide a concise answer to the user's question. Do not use any prior knowledge. If the context does not contain the answer, say so.
+
+                        Context:
+                        {combined_context}
+
+                        ---
+                        User Question: {query_text}
+                        ---
+
+                        Answer:"""
+
+            try:
+                # Use the initialized LLM instance
+                print("Sending prompt to LLM...")
+                # print(f"Prompt:\n{prompt}") # Uncomment to debug the exact prompt
+                llm_response = llm.invoke(prompt)
+                print("LLM response received.")
+                final_answer = llm_response.strip() # Use the LLM's response
+            except Exception as e:
+                print(f"!!! ERROR invoking LLM: {e} !!!")
+                final_answer = "Error generating answer from context. Using raw context instead.\n\n" + combined_context # Fallback
+
+        else:
+             print("No relevant text context found in Qdrant results.")
+
+
+        # 5. Load and encode images
         encoded_images: List[str] = []
+        print(f"Attempting to load {len(retrieved_image_paths)} unique image paths...")
         for img_path in retrieved_image_paths:
             try:
-                # Construct full path if needed (though paths should be stored correctly now)
-                full_img_path = img_path # Paths should be stored directly usable
-                if os.path.exists(full_img_path):
-                    with open(full_img_path, "rb") as image_file:
+                if os.path.exists(img_path):
+                    with open(img_path, "rb") as image_file:
                         image_data = image_file.read()
                         encoded_string = base64.b64encode(image_data).decode('utf-8')
                         encoded_images.append(encoded_string)
                 else:
-                     print(f"Warning: Image file not found at {full_img_path}")
+                     print(f"Warning: Image file not found at final path check: {img_path}")
             except Exception as e:
                 print(f"Error reading or encoding image {img_path}: {e}")
 
-        return {"answer": answer, "images": encoded_images}
+        print(f"Returning answer and {len(encoded_images)} images.")
+        return {"answer": final_answer, "images": encoded_images}
 
     except Exception as e:
         print(f"Error during query processing: {e}")
-        # Provide detailed error back if needed, or a generic message
+        # Include traceback in logs for detailed debugging
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
-
-if __name__ == "__main__":
+if __name__ == "__main__": 
     print("Starting FastAPI server...")
     print(f"Qdrant URL: {QDRANT_URL}")
     print(f"Ollama URL: {OLLAMA_URL}")
