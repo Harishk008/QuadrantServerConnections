@@ -19,9 +19,9 @@ from langchain_ollama import OllamaLLM
 app = FastAPI()
 
 # --- Configuration ---
-QDRANT_URL = os.getenv("QDRANT_URL", "http://ai-lab.sagitec.com:6333")
+QDRANT_URL = os.getenv("QDRANT_URL", "ai-lab.sagitec.com")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ai-lab.sagitec.com:11434/")
-EMBED_MODEL = "mxbai-embed-large:latest"
+EMBED_MODEL = "all-minilm:33m"
 EMBEDDING_DIM = 1024
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-r1:8b")
 DEFAULT_COLLECTION = "my_docs"

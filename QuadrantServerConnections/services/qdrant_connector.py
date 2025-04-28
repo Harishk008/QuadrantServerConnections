@@ -7,7 +7,7 @@ class QdrantConnector:
         self.url = url
         self.api_key = api_key
         self.vector_size = vector_size
-        self.client = QdrantClient(url=url, api_key=api_key)
+        self.client = QdrantClient(url=url, api_key=api_key,prefer_grpc= True)
 
     def get_client(self):
         return self.client
